@@ -141,6 +141,9 @@ func (inode *Inode) OpenDir() (dh *DirHandle) {
 			// peers to bound the time. If the next dir is
 			// more than 1000 away, slurping isn't going
 			// to be helpful anyway
+
+			// 第一次 OpenDir()
+			// 第一二个 dentry 是 . 和 ..，因此从 2 开始搜索
 			for i := 2; i < MinInt(numChildren, 1000); i++ {
 				c := parent.dir.Children[i]
 				if c.isDir() {
@@ -166,7 +169,7 @@ func (inode *Inode) OpenDir() (dh *DirHandle) {
 			}
 		}
 
-		if seqMode {
+		if seqMode { // 在前 1000 个 dentry 中搜索到 inode
 			if parent.dir.seqOpenDirScore < 255 {
 				parent.dir.seqOpenDirScore++
 			}
@@ -189,7 +192,9 @@ func (inode *Inode) OpenDir() (dh *DirHandle) {
 			}
 		} else {
 			parent.dir.seqOpenDirScore = 0
-			if dirIdx == -1 {
+			// QUESTION: findChildIdxUnlocked() 使用 sort.Search()，算法复杂度
+			// 为 O(logN)，为什么前面还要线性搜索前 1000 个 dentry？
+			if dirIdx == -1 { // 因为 dir 未被搜索到，dirIdx 肯定为 -1
 				dirIdx = parent.findChildIdxUnlocked(*inode.Name)
 			}
 			if dirIdx != -1 {
@@ -203,6 +208,11 @@ func (inode *Inode) OpenDir() (dh *DirHandle) {
 	return
 }
 
+// 从 prefix 开始 list dh.Parent 的 dentry，并调用 insertSubTree() 递归地更新
+// 当 ListBlobs() 分页并且不能认为已完成时，listObjectsSlurp() 返回值 resp 为 nil。
+// 上层 listObjects() 认为 listObjectsSlurp() 失败，尝试调用 listObjectsSate() 。
+//
+// 注意，listObjSlurp() 更新的子树元数据都是错误的，是子树根结点的属性。
 func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *ListBlobsOutput, err error) {
 	var marker *string
 	reqPrefix := prefix
@@ -228,6 +238,7 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *ListBlobsOutput, err
 		}
 	}
 
+	// reqPrefix 是 dh 的父结点路径，marker 是 dh 的路径
 	params := &ListBlobsInput{
 		Prefix:     &reqPrefix,
 		StartAfter: marker,
@@ -249,10 +260,12 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *ListBlobsOutput, err
 
 	dirs := make(map[*Inode]bool)
 	for _, obj := range resp.Items {
+		// 正在 readdir() 的 dentry 的兄弟
 		baseName := (*obj.Key)[len(reqPrefix):]
 
 		slash := strings.Index(baseName, "/")
 		if slash != -1 {
+			// 递归地构建整个树
 			inode.insertSubTree(baseName, &obj, dirs)
 		}
 	}
@@ -277,9 +290,13 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *ListBlobsOutput, err
 		// if we are done listing prefix, we are good
 		if strings.HasPrefix(*obj.Key, prefix) {
 			// if we are done with all the slashes, then we are good
+			// 这里的 prefix 不包括 /
+			// QUESTION: 剩下的非目录怎么办？
 			baseName := (*obj.Key)[len(prefix):]
 
 			for _, c := range baseName {
+				// baseName 是此次 ListOutput 的最大值，如果每个字符都大于 '/',
+				// 说明下一页不会有形如 dir/file 的 key 出现。
 				if c <= '/' {
 					// if an entry is ex: a!b, then the
 					// next entry could be a/foo, so we
@@ -300,6 +317,9 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *ListBlobsOutput, err
 	return
 }
 
+// listObjects() 从 prefix 开始 list dh.Parent 的后代
+// 先尝试调用 listObjectsSlurp() 更新兄弟结点，失败则调用 listObjectsSafe()
+// 再次 ListBlobs() **全部** blob，并且不尝试 insertSubTree()。
 func (dh *DirHandle) listObjects(prefix string) (resp *ListBlobsOutput, err error) {
 	errSlurpChan := make(chan error, 1)
 	slurpChan := make(chan ListBlobsOutput, 1)
@@ -450,7 +470,11 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 	// 3. when we serve the entry we added last, signal that next
 	//    time we need to list from cloud again with continuation
 	//    token
+
+	// !dh.done 控制分页
+	// QUESTION: lastFromCloud 为 nil 说明时第一次，或者还没返回过兄弟和孩子中的最大值
 	for dh.lastFromCloud == nil && !dh.done {
+		// 不是第一次循环(在分页中)
 		if dh.Marker == nil {
 			// Marker, lastFromCloud are nil => We just started
 			// refreshing this directory info from cloud.
@@ -476,12 +500,15 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 		fs.mu.Lock()
 
 		// this is only returned for non-slurped responses
+		// 对于 listObjectsSlurp()，所有的兄弟都已经插入好了，
+		// 因此只会新建 listObjectsSafe() 返回的兄弟 dentry。
 		for _, dir := range resp.Prefixes {
 			// strip trailing /
 			dirName := (*dir.Prefix)[0 : len(*dir.Prefix)-1]
 			// strip previous prefix
+			// ReadDir() 的 dentry 的兄弟的 basename（不包括 '/'）
 			dirName = dirName[len(prefix):]
-			if len(dirName) == 0 {
+			if len(dirName) == 0 { // parent//
 				continue
 			}
 
@@ -505,6 +532,8 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 			dh.lastFromCloud = &dirName
 		}
 
+		// 前面处理完了 Readdir() dentry 的兄弟（对于 slurp 的 response，兄弟
+		// 的后代页处理好了），现在处理 ReadDir() dentry 的直接后代。
 		for _, obj := range resp.Items {
 			if !strings.HasPrefix(*obj.Key, prefix) {
 				// other slurped objects that we cached
@@ -513,13 +542,15 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 
 			baseName := (*obj.Key)[len(prefix):]
 
+			// baseName 是下面 dir/ 后面的部分
 			slash := strings.Index(baseName, "/")
 			if slash == -1 {
-				if len(baseName) == 0 {
+				if len(baseName) == 0 { // dir/
 					// shouldn't happen
 					continue
 				}
 
+				// dir/basename
 				inode := parent.findChildUnlocked(baseName)
 				if inode == nil {
 					inode = NewInode(fs, parent, &baseName)
@@ -530,13 +561,16 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 					fs.insertInode(parent, inode)
 				}
 				inode.SetFromBlobItem(&obj)
-			} else {
+			} else { // dir/dir2/...
 				// this is a slurped up object which
 				// was already cached
-				baseName = baseName[:slash]
+				// ReadDir() dentry 的孩子的 basename
+				baseName = baseName[:slash] // dir2/...
 			}
 
 			if dh.lastFromCloud == nil ||
+				// ReadDir() dentry 的孩子的 basename 大于 兄弟的 basename
+				// dh.lastFromCloud 是 ReadDir() dentry 的兄弟或孩子的 basename 最大者
 				strings.Compare(*dh.lastFromCloud, baseName) < 0 {
 				dh.lastFromCloud = &baseName
 			}
@@ -557,6 +591,14 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
+	// 上面的操作全部是为了同步 cache，且只处理和更新、新增，没有处理删除。
+	//
+	// 所有 listObjects()->listObjectsSlurp() 时扫描到的孩子（包括他们的后代）的 AttrTime 都已更新。
+	// 所有 listObjects()->listObjectsSafe() 时扫描到的孩子，都在上面更新了。
+	// 因此 AttrTime 更旧的就是 listObjects() 时已被删除的 ReadDir() dentry 的孩子。
+	//
+	// 注意，不删除已打开的文件。
+	//
 	// Find the first non-stale child inode with offset >=
 	// `offset`. A stale inode is one that existed before the
 	// first ListBlobs for this dir handle, but is not being
@@ -579,6 +621,7 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 		}
 	}
 
+	// 剩下的所有 dentry 均被删除
 	if child == nil {
 		// we've reached the end
 		parent.dir.DirTime = time.Now()
@@ -1144,10 +1187,14 @@ func (parent *Inode) renameObject(fs *Goofys, size *uint64, fromFullName string,
 
 // if I had seen a/ and a/b, and now I get a/c, that means a/b is
 // done, but not a/
+// isParentOf() 实际上判断的是 parent 是否是 inode 的祖先！
+// 什么垃圾代码垃圾命名！！明明是 isAnsestorOf()!
 func (parent *Inode) isParentOf(inode *Inode) bool {
 	return inode.Parent != nil && (parent == inode.Parent || parent.isParentOf(inode.Parent))
 }
 
+// 在 DFS 中调用，将 d 的祖先意外的结点标记为 true（已构建完成）。
+// d 标记为 false是因为可能被其他的 sealPastDirs() 错误的标记为 true。
 func sealPastDirs(dirs map[*Inode]bool, d *Inode) {
 	for p, sealed := range dirs {
 		if p != d && !sealed && !p.isParentOf(d) {
@@ -1161,17 +1208,21 @@ func sealPastDirs(dirs map[*Inode]bool, d *Inode) {
 // LOCKS_REQUIRED(fs.mu)
 // LOCKS_REQUIRED(parent.mu)
 // LOCKS_REQUIRED(parent.fs.mu)
+// 递归的构建整个树
+// path 是父亲 prefix 之后的部分（不包括 '/')
+// object 是最开始的 insertSubTree() 实例的参数
 func (parent *Inode) insertSubTree(path string, obj *BlobItemOutput, dirs map[*Inode]bool) {
 	fs := parent.fs
 	slash := strings.Index(path, "/")
+	// 根结点（文件）
 	if slash == -1 {
 		inode := parent.findChildUnlocked(path)
-		if inode == nil {
+		if inode == nil { // 新增
 			inode = NewInode(fs, parent, &path)
 			inode.refcnt = 0
 			fs.insertInode(parent, inode)
 			inode.SetFromBlobItem(obj)
-		} else {
+		} else { // 修改
 			// our locking order is most specific lock
 			// first, ie: lock a/b before a/. But here we
 			// already have a/ and also global lock. For
@@ -1184,23 +1235,25 @@ func (parent *Inode) insertSubTree(path string, obj *BlobItemOutput, dirs map[*I
 			parent.mu.Lock()
 			fs.mu.Lock()
 		}
-		sealPastDirs(dirs, parent)
-	} else {
+		sealPastDirs(dirs, parent) // seal 包括次
+	} else { // 目录
+		// dir 是 readdir() 的 dentry 的兄弟
 		dir := path[:slash]
+		// path 是 readdir() 的 dentry 的侄子
 		path = path[slash+1:]
 
-		if len(path) == 0 {
+		if len(path) == 0 { // parent/dir/
 			inode := parent.findChildUnlocked(dir)
-			if inode == nil {
+			if inode == nil { // dir 是新建的
 				inode = NewInode(fs, parent, &dir)
 				inode.ToDir()
 				inode.refcnt = 0
 				fs.insertInode(parent, inode)
 				inode.SetFromBlobItem(obj)
-			} else if !inode.isDir() {
+			} else if !inode.isDir() { // 文件 dir 变成了目录
 				inode.ToDir()
 				fs.addDotAndDotDot(inode)
-			} else {
+			} else { // 目录 dir 更新状态
 				fs.mu.Unlock()
 				parent.mu.Unlock()
 				inode.SetFromBlobItem(obj)
@@ -1208,7 +1261,7 @@ func (parent *Inode) insertSubTree(path string, obj *BlobItemOutput, dirs map[*I
 				fs.mu.Lock()
 			}
 			sealPastDirs(dirs, inode)
-		} else {
+		} else { // parent/dir/path
 			// ensure that the potentially implicit dir is added
 			inode := parent.findChildUnlocked(dir)
 			if inode == nil {
@@ -1338,8 +1391,11 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 	}
 
 	go parent.LookUpInodeNotDir(name, objectChan, errObjectChan)
+	// !cloud.Capabilities().DirBlob -> 目录必须是 dir/
+	// !parent.fs.flags.Cheap -> 不需要节省 S3 操作
 	if !cloud.Capabilities().DirBlob && !parent.fs.flags.Cheap {
 		go parent.LookUpInodeNotDir(name+"/", objectChan, errDirBlobChan)
+		// !parent.fs.flags.ExplicitDir -> 不存储目录对象，目录只是一个 prefix
 		if !parent.fs.flags.ExplicitDir {
 			errDirChan = make(chan error, 1)
 			dirChan = make(chan ListBlobsOutput, 1)
@@ -1349,6 +1405,7 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 
 	for {
 		select {
+		// HeadBlob dir/file
 		case resp := <-objectChan:
 			err = nil
 			inode = NewInode(parent.fs, parent, &name)
@@ -1383,23 +1440,26 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 					}
 
 				}
+				// ImpilicitDir 指该 dir 只是一个 prefix，实际上不存在该 blob。
+				// 这里只在 inode.fs.flags.Cheap 为真时设置，是因为 ImpilicitDir
+				// 可以避免一些 s3 操作，没制定 cheap 时不需要避免。
 				// if cheap is not on, the dir blob
 				// could exist but this returned first
 				if inode.fs.flags.Cheap {
 					inode.ImplicitDir = true
 				}
 				return
-			} else {
+			} else { // 找到了该 dir 但其中没有对象
 				checkErr[2] = fuse.ENOENT
 				checking--
 			}
 		case err = <-errDirChan:
 			checking--
-			checkErr[2] = err
+			checkErr[2] = err // ListBlobs dir 不存在
 			s3Log.Debugf("LIST %v/ = %v", fullName, err)
 		case err = <-errDirBlobChan:
 			checking--
-			checkErr[1] = err
+			checkErr[1] = err // HeadBlobs dir 失败
 			s3Log.Debugf("HEAD %v/ = %v", fullName, err)
 		}
 

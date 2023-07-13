@@ -624,16 +624,20 @@ func (fs *Goofys) LookUpInode(
 	}
 	parent.mu.Unlock()
 
+	// 需要取 OSS 查找（indoe 未查找到或过期）
 	if !ok {
 		var newInode *Inode
 
+		// 重新搜索该 inode，这次会使用 ListBLobs/HeadBlobs 从 OSS 搜索。
 		newInode, err = parent.LookUp(op.Name)
+		// 该 inode 已被删除
 		if err == fuse.ENOENT && inode != nil && inode.isDir() {
 			// we may not be able to look up an implicit
 			// dir if all the children are removed, so we
 			// just pretend this dir is still around
 			err = nil
 		} else if err != nil {
+			// inode 过期
 			if inode != nil {
 				// just kidding! pretend we didn't up the ref
 				fs.mu.Lock()
@@ -648,7 +652,10 @@ func (fs *Goofys) LookUpInode(
 			return err
 		}
 
+		// newInode 不为 nil
 		if inode == nil {
+			// parent.mu.Unlock() 后，另外一次 lookup 执行到后面，创建了新 inode
+			// 并插入。
 			parent.mu.Lock()
 			// check again if it's there, could have been
 			// added by another lookup or readdir
@@ -660,10 +667,10 @@ func (fs *Goofys) LookUpInode(
 				fs.mu.Unlock()
 			}
 			parent.mu.Unlock()
-		} else {
+		} else { // inode 存在,NewInode 也存在，需要判断更新属性和etag，并 invalidate cache
 			inode.mu.Lock()
 
-			if newInode != nil {
+			if newInode != nil { // 多余的 if，如果 newInode 为 nil，就要删除该 inode 了。
 				// if only size changed, kernel seems to
 				// automatically drop cache
 				if !inode.Attributes.Equal(newInode.Attributes) {
