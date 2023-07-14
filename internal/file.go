@@ -39,7 +39,7 @@ type FileHandle struct {
 
 	mu              sync.Mutex
 	mpuId           *MultipartBlobCommitInput
-	nextWriteOffset int64
+	nextWriteOffset int64 // 下次应写的 offset，用于检测是否是顺序写
 	lastPartId      uint32
 
 	poolHandle *BufferPool
@@ -49,19 +49,19 @@ type FileHandle struct {
 
 	// read
 	reader        io.ReadCloser
-	readBufOffset int64
+	readBufOffset int64 // 顺序读时下次应读的 offset，用于检测顺序读
 
 	// parallel read
 	buffers           []*S3ReadBuffer
 	existingReadahead int
-	seqReadAmount     uint64
+	seqReadAmount     uint64 // 顺序读的字节数
 	numOOORead        uint64 // number of out of order read
 	// User space PID. All threads created by a process will have the same TGID,
 	// but different PIDs[1].
 	// This value can be nil if we fail to get TGID from PID[2].
 	// [1] : https://godoc.org/github.com/shirou/gopsutil/process#Process.Tgid
 	// [2] : https://github.com/shirou/gopsutil#process-class
-	Tgid *int32
+	Tgid *int32 // 记录的打开该文件的 tgid（用户所见的 pid）
 
 	keepPageCache bool // the same value we returned to OpenFile
 }

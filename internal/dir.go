@@ -35,10 +35,14 @@ type DirInodeData struct {
 	mountPrefix string
 
 	// these 2 refer to readdir of the Children
-	lastOpenDir     *DirInodeData
-	lastOpenDirIdx  int
-	seqOpenDirScore uint8
-	DirTime         time.Time
+	// 以下两个字段用于判断是否是顺序的 OpenDir
+	lastOpenDir    *DirInodeData
+	lastOpenDirIdx int
+	// 用于判断是否在 readdir() 模式中。
+	// 测试中大量使用此字段判断 readdir() 的便利。
+	// listObjSlurp() 用 seqOpenDirScore>=2 判断是否要 slurp
+	seqOpenDirScore uint8     // 用于判断测试
+	DirTime         time.Time // 和 TypeCacheTTL 比较是否过期
 
 	Children []*Inode
 }
@@ -194,6 +198,8 @@ func (inode *Inode) OpenDir() (dh *DirHandle) {
 			parent.dir.seqOpenDirScore = 0
 			// QUESTION: findChildIdxUnlocked() 使用 sort.Search()，算法复杂度
 			// 为 O(logN)，为什么前面还要线性搜索前 1000 个 dentry？
+			// 因为需要用 seqOpenDirScore 判断是否在 readdir 模式，listObjectsSlurp()
+			// 用 seqOpenDirScore 判断是否需要 slurp。
 			if dirIdx == -1 { // 因为 dir 未被搜索到，dirIdx 肯定为 -1
 				dirIdx = parent.findChildIdxUnlocked(*inode.Name)
 			}
@@ -471,8 +477,10 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 	//    time we need to list from cloud again with continuation
 	//    token
 
-	// !dh.done 控制分页
-	// QUESTION: lastFromCloud 为 nil 说明时第一次，或者还没返回过兄弟和孩子中的最大值
+	// !dh.done 控制分页。实际上listObjects() 只在 list 返回空页时，IsTruncated 为真，
+	// 因此实际上 dh.done 总为真。
+	// lastFromCloud 为 nil 说明时第一次，或者读过了上次从 cloud 获取
+	// 的 dentry(basename 最大的兄弟或孩子)。
 	for dh.lastFromCloud == nil && !dh.done {
 		// 不是第一次循环(在分页中)
 		if dh.Marker == nil {
@@ -1322,6 +1330,7 @@ func (parent *Inode) readDirFromCache(offset fuseops.DirOffset) (en *DirHandleEn
 		ok = true
 
 		if int(offset) >= len(parent.dir.Children) {
+
 			return
 		}
 		child := parent.dir.Children[offset]

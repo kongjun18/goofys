@@ -48,7 +48,13 @@ type Inode struct {
 	Name       *string
 	fs         *Goofys
 	Attributes InodeAttributes
-	KnownSize  *uint64
+	// 目前已知的文件大小
+	//
+	// toDir()将其设置为文件系统的rootAttrs.Size
+	// SetFromBlobItem()将其设置为 OSS 返回的大小
+	//
+	// FlushFile() 将 inode 的 size 设置为 KnownSize
+	KnownSize *uint64
 	// It is generally safe to read `AttrTime` without locking because if some other
 	// operation is modifying `AttrTime`, in most cases the reader is okay with working with
 	// stale data. But Time is a struct and modifying it is not atomic. However
@@ -77,6 +83,10 @@ type Inode struct {
 	s3Metadata   map[string][]byte
 
 	// last known etag from the cloud
+	// WriteFile(offset:0) 设置为 nil，下次 LookUpInode 认为未发生修改
+	//
+	// - 使 read 优先读自己的 write
+	// - LookUpInode 判断是否发生变化
 	knownETag *string
 	// tell the next open to invalidate page cache because the
 	// file is changed. This is set when LookUp notices something
